@@ -123,7 +123,7 @@ impl LocalPtr {
 }
 
 pub struct LocalPtrChain {
-    current: LocalPtr
+    current: LocalPtr,
 }
 
 impl LocalPtrChain {
