@@ -26,6 +26,7 @@ An enum describing low-level failure modes: `NullPointer`, `InvalidLength`, `Vir
 Represents the current module (the process / DLL where the code runs):
 
 * `ModuleContext::current() -> Result<ModuleContext, MemoryError>` — queries Windows (`GetModuleHandleW` + `GetModuleInformation`) to obtain module base + size.
+
 * `pattern_scan(&self, pattern: &[Option<u8>]) -> Result<LocalPtr, MemoryError>` — reads the module via `ReadProcessMemory` into a `Vec<u8>` and searches for the pattern with wildcards.
 
 ### `LocalPtr`
@@ -33,12 +34,19 @@ Represents the current module (the process / DLL where the code runs):
 A small wrapper around a raw address in the current process (`usize`). Methods return `Result` and are crash-safe:
 
 * `from_addr(address: usize) -> LocalPtr` — construct from address.
+
 * `offset(&self, off: isize) -> Result<LocalPtr, MemoryError>` — add/subtract offset with checked arithmetic.
+
 * `read_bytes(&self, len: usize) -> Result<Vec<u8>, MemoryError>` — read bytes using `ReadProcessMemory`. Returns `Err` instead of causing an access violation when memory is unreadable.
+
 * `deref(&self) -> Result<LocalPtr, MemoryError>` — read a pointer-sized value using `read_bytes` (handles both 32- and 64-bit).
+
 * `rip_relative(&self, offset_offset: isize, instruction_len: isize) -> Result<LocalPtr, MemoryError>` — resolve RIP-relative addressing (reads a 32-bit displacement and computes target).
+
 * `write_bytes(&self, data: &[u8]) -> Result<(), MemoryError>` — direct local write (kept for internal uses).
+
 * `write_bytes_protected(&self, data: &[u8]) -> Result<(), MemoryError>` — change page protections and write safely via `WriteProcessMemory`, then `FlushInstructionCache`.
+
 * `chain(self) -> LocalPtrChain` — start a fluent pointer-chasing chain.
 
 ### `LocalPtrChain`
@@ -46,7 +54,9 @@ A small wrapper around a raw address in the current process (`usize`). Methods r
 Fluent-style API for pointer chasing; methods return `Result`:
 
 * `offset(self, off: isize) -> Result<Self, MemoryError>`
+
 * `deref(self) -> Result<Self, MemoryError>`
+
 * `finish(self) -> LocalPtr`
 
 ---
@@ -55,6 +65,7 @@ Fluent-style API for pointer chasing; methods return `Result`:
 Patterns are `&[Option<u8>]`. Example:
 
 * `Some(0x48)` means the byte must match 0x48.
+ 
 * `None` is a wildcard (`??`).
 
 Example pattern used in the library:
