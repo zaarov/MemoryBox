@@ -1,169 +1,95 @@
 # Memory Box
 
-Memory Box is a small, focused Rust library for local memory manipulation intended to help the development of DLL mods and hooks.
+Small, pragmatic Rust library for **local process memory manipulation** — mainly useful when developing **DLL mods**, **game trainers**, or memory-based hooks on Windows.
 
-**Status:** Experimental / Alpha — the crate is under development and may change. Recommended to use only in controlled environments.
+**Status:** Experimental / Alpha — API is still evolving.
+**Platform:** Windows (can work at linux if your game or application are running through proton, wine, bottles, etc)
 
 ---
 
 ## Installation
 
-To include Memory Box in your Rust project, add the following line to your `Cargo.toml`:
-
 ```toml
-memory_box = { git = "https://github.com/Dzavoy/MemoryBox.git" }
+memory_box = { git = "https://github.com/zaarov/MemoryBox.git" }
 ```
-
-## Goals
-
-* Provide simple, pragmatic helpers for scanning and reading/writing memory inside the current process (DLL context).
-* Keep the API minimal and explicit about unsafe operations.
-* Support pattern/signature scanning with wildcard bytes, pointer chaining, RIP-relative helpers and safe wrappers for protected writes.
 
 ---
 
 ## Key concepts & types
 
-### `scan_bytes(hay: &[u8], pattern: &[Option<u8>]) -> Option<usize>`
+### `MemoryError`
 
-Searches a byte slice (`hay`) for a pattern described by `pattern` where `Some(byte)` is a match and `None` is a wildcard.
-
-* Returns the index in `hay` where the pattern starts, or `None` if not found.
-* Optimized to use fast searches when the pattern has no wildcards or is entirely wildcards.
-
-> **Implementation note:** the implementation uses a fast-search optimization that locates a defined byte inside the pattern (the first defined byte) and then checks the whole pattern starting at candidate positions. A common bug is to forget that `memchr_iter` returns indices relative to the search slice; the implementation must add the slice start offset to the `memchr_iter` result before validating the full pattern.
-
-```rust
-for rel in memchr_iter(fc_byte, search_area) {
-    // rel is relative to `search_area` which begins at `fc_idx`
-    let base_idx = fc_idx + rel;
-    let mut ok = true;
-    for j in 0..plen {
-        match pattern[j] {
-            Some(b) => {
-                if hay[base_idx + j] != b {
-                    ok = false;
-                    break;
-                }
-            }
-            None => {}
-        }
-    }
-    if ok {
-        return Some(base_idx);
-    }
-}
-```
+An enum describing low-level failure modes: `NullPointer`, `InvalidLength`, `VirtualProtectFailed`, `ReadFailed`, `WriteFailed`, `OutOfBounds`. All public APIs return `Result<..., MemoryError>`.
 
 ### `ModuleContext`
 
 Represents the current module (the process / DLL where the code runs):
 
-* `ModuleContext::current() -> Option<Self>` — queries Windows to get the module base and size using `GetModuleHandleW` + `GetModuleInformation`.
-* `pattern_scan(&self, pattern: &[Option<u8>]) -> Option<LocalPtr>` — scans the module image for the given wildcard pattern and returns a `LocalPtr` pointing to the match.
+* `ModuleContext::current() -> Result<ModuleContext, MemoryError>` — queries Windows (`GetModuleHandleW` + `GetModuleInformation`) to obtain module base + size.
+* `pattern_scan(&self, pattern: &[Option<u8>]) -> Result<LocalPtr, MemoryError>` — reads the module via `ReadProcessMemory` into a `Vec<u8>` and searches for the pattern with wildcards.
 
 ### `LocalPtr`
 
-A small wrapper around a raw address in the current process (`usize`). Common helpers:
+A small wrapper around a raw address in the current process (`usize`). Methods return `Result` and are crash-safe:
 
-* `offset(&self, off: isize) -> Option<LocalPtr>` — add/subtract an offset safely (checked arithmetic).
-* `read_bytes(&self, len: usize) -> Option<Vec<u8>>` — read `len` bytes from the address.
-* `read_i32_le(&self) -> Option<i32>` — read a 32-bit little-endian integer.
-* `deref()` — read a pointer-sized value from the address and return a `LocalPtr` to that pointer. Handles 32-bit and 64-bit targets.
-* `rip_relative(&self, offset_offset: isize, instruction_len: isize) -> Option<Self>` — helper for resolving RIP-relative addressing (common in x86-64): it reads a 32-bit displacement at `self + offset_offset` and returns the absolute target `self + instruction_len + disp`.
-* `write_bytes(&self, data: &[u8]) -> Option<()>` — copy bytes into the address (unsafe raw memory write).
-* `write_bytes_protected(&self, data: &[u8]) -> Option<()>` — temporarily changes page protection to `PAGE_READWRITE` using `VirtualProtect`, performs the write, then restores the previous protection. Useful for overwriting code pages.
-* `write_f32()` / `write_f32_protected()` — convenience wrappers for writing `f32` values.
-* `chain(self) -> LocalPtrChain` — start a builder-style chain to follow offsets and dereferences.
+* `from_addr(address: usize) -> LocalPtr` — construct from address.
+* `offset(&self, off: isize) -> Result<LocalPtr, MemoryError>` — add/subtract offset with checked arithmetic.
+* `read_bytes(&self, len: usize) -> Result<Vec<u8>, MemoryError>` — read bytes using `ReadProcessMemory`. Returns `Err` instead of causing an access violation when memory is unreadable.
+* `deref(&self) -> Result<LocalPtr, MemoryError>` — read a pointer-sized value using `read_bytes` (handles both 32- and 64-bit).
+* `rip_relative(&self, offset_offset: isize, instruction_len: isize) -> Result<LocalPtr, MemoryError>` — resolve RIP-relative addressing (reads a 32-bit displacement and computes target).
+* `write_bytes(&self, data: &[u8]) -> Result<(), MemoryError>` — direct local write (kept for internal uses).
+* `write_bytes_protected(&self, data: &[u8]) -> Result<(), MemoryError>` — change page protections and write safely via `WriteProcessMemory`, then `FlushInstructionCache`.
+* `chain(self) -> LocalPtrChain` — start a fluent pointer-chasing chain.
 
 ### `LocalPtrChain`
 
-A tiny fluent API for pointer chasing:
+Fluent-style API for pointer chasing; methods return `Result`:
 
-* `offset(self, off: isize) -> Option<Self>` — add offset.
-* `deref(self) -> Option<Self>` — dereference.
-* `finish(self) -> LocalPtr` — get the resulting pointer.
-
-> **Usage note:** `LocalPtrChain::offset` and `deref` return `Option<LocalPtrChain>`. When using the fluent chain with `?` you must be inside a function (or closure) that returns `Option` (or `Result`) to use `?` directly. See examples below.
+* `offset(self, off: isize) -> Result<Self, MemoryError>`
+* `deref(self) -> Result<Self, MemoryError>`
+* `finish(self) -> LocalPtr`
 
 ---
 
-## Usage examples
+## Pattern format
+Patterns are `&[Option<u8>]`. Example:
 
-> All memory manipulation should be considered `unsafe`. Examples below demonstrate how the crate is intended to be used.
+* `Some(0x48)` means the byte must match 0x48.
+* `None` is a wildcard (`??`).
 
-### Pattern scan in the current module
-
+Example pattern used in the library:
 ```rust
 // pattern: Some(0xDE), Some(0xAD), None, Some(0xBE) means "DE AD ?? BE"
-let pattern: &[Option<u8>] = &[Some(0xDE), Some(0xAD), None, Some(0xBE)];
-if let Some(ctx) = ModuleContext::current() {
-    if let Some(ptr) = ctx.pattern_scan(pattern) {
-        println!("found at: 0x{:X}", ptr.address);
-    }
-}
-```
-
-### Read a 32-bit value behind a pointer chain
-
-This example uses `?`, so it must be inside a function returning `Option<T>` (or a closure). The pattern below is the recommended idiom for linear chaining.
-
-```rust
-fn read_chained_value(base: LocalPtr) -> Option<i32> {
-    // follow: base + 0x10 -> deref -> +0x8 -> deref -> final address
-    let final_ptr = base
-        .chain()
-        .offset(0x10)?      // Option<LocalPtrChain>
-        .deref()?           // Option<LocalPtrChain>
-        .offset(0x8)?
-        .deref()?
-        .finish();          // LocalPtr
-
-    final_ptr.read_i32_le()
-}
-```
-
-### Overwrite code bytes (temporary page-protection change)
-
-```rust
-let target = LocalPtr { address: 0x7FF6_1234_0000 };
-let new_bytes: [u8; 5] = [0x90, 0x90, 0x90, 0x90, 0x90];
-let ok = target.write_bytes_protected(&new_bytes);
-match ok {
-    Some(()) => println!("patched"),
-    None => eprintln!("patch failed"),
-}
-```
-
-### Real example
-
-The project uses a signature pattern to find the game manager, resolves a RIP-relative pointer, then follows a chain of offsets to reach a structure containing multiple buff floats. The `apply()` function zeroes those buff values by writing `f32` `0.0` with protected writes.
-
-```rust
-use memory_box::{ModuleContext, LocalPtr};
-
 const GAME_MANAGER_IMP: [Option<u8>; 17] = [
     Some(0x48),
-    Some(0x8B),
+    Some(0x8B), 
     Some(0x05),
+    None, 
+    None, 
+    None, 
     None,
-    None,
-    None,
-    None,
-    Some(0x48),
-    Some(0x8B),
-    Some(0x58),
+    Some(0x48), 
+    Some(0x8B), 
+    Some(0x58), 
     Some(0x38),
-    Some(0x48),
-    Some(0x85),
-    Some(0xDB),
+    Some(0x48), 
+    Some(0x85), 
+    Some(0xDB), 
     Some(0x74),
-    None,
-    Some(0xF6)
+    None, 
+    Some(0xF6),
 ];
+```
 
-pub fn apply() -> Option<()> {
-    let param_start: LocalPtr = ModuleContext::current()?
+### Examples
+
+## Resolve a pointer chain and read an `f32` (safe)
+
+```rust
+use memory_box::{ModuleContext, MemoryError};
+
+fn read_health() -> Result<f32, MemoryError> {
+    let ptr = ModuleContext::current()?
         .pattern_scan(&GAME_MANAGER_IMP)?
         .rip_relative(3, 7)?
         .deref()?
@@ -178,32 +104,32 @@ pub fn apply() -> Option<()> {
         .offset(0x60C)?
         .finish();
 
-    const BUFFS: [isize; 7] = [0x254, 0x274, 0x294, 0x2B4, 0x2D4, 0x2F4, 0x3B4];
-
-    for &off in &BUFFS {
-        param_start.offset(off)?.write_f32_protected(0.0)?;
-    }
-
-    Some(())
+    let bytes = ptr.read_bytes(4)?;
+    let value = f32::from_le_bytes(bytes.try_into().map_err(|_| MemoryError::ReadFailed)?);
+    Ok(value)
 }
 ```
 
----
+## Read a primitive helper
+```rust
+fn read_addr_as_i32(addr: LocalPtr) -> Result<i32, MemoryError> {
+    let bytes = addr.read_bytes(4)?;
+    Ok(i32::from_le_bytes(bytes.try_into().map_err(|_| MemoryError::ReadFailed)?))
+}
+```
+## Protected write (patch code/data)
 
-## Platform notes
+```rust
+let target: LocalPtr = LocalPtr::from_addr(0x7FF6_1234_0000);
+let new_bytes: [u8; 5] = [0x90, 0x90, 0x90, 0x90, 0x90];
+target.write_bytes_protected(&new_bytes)?;
+```
+`write_bytes_protected` will:
 
-* The current implementation is Windows-specific and uses `windows_sys` to query module information and change memory protections.
-* Pointer-size awareness: dereference reads 4 bytes on 32-bit targets and 8 bytes on 64-bit targets.
-* `write_bytes_protected` sets protection on a single 4KB page (the implementation derives `start_page` from the target address and uses a constant page size of `0x1000`). **Large writes that cross page boundaries are not automatically handled — callers must ensure safety for multi-page writes.**
+* call `VirtualProtect` to set `PAGE_READWRITE`,
 
----
+* write with `WriteProcessMemory`,
 
-## Safety
+* restore the old protection,
 
-This crate performs `unsafe` operations internally (raw pointer reads/writes and calls to `VirtualProtect`). The public API returns `Option` to indicate failures, but callers must treat all memory writes and pointer chasing as potentially dangerous. Use only in controlled, trusted environments.
-
----
-
-## Development & contributing
-
-If you want this crate to support remote processes, additional OSes, or more robust pattern engines (masks, AOB with `?` wildcards in a string form), feel free to open issues or PRs.
+* call `FlushInstructionCache`.
